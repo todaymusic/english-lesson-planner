@@ -1,18 +1,10 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from "@/components/ui/dialog";
 import {
   Select,
   SelectContent,
@@ -23,44 +15,69 @@ import {
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/")({
-  component: BookingPage,
+  component: BookingFlowPage,
   head: () => ({
     meta: [
       { title: "전화영어 수업 예약" },
-      { name: "description", content: "원하는 시간에 전화영어 수업을 예약하세요." },
+      { name: "description", content: "초대 코드 인증 후 수업 요일과 시간을 선택해 예약하세요." },
     ],
   }),
 });
 
-const TEACHERS = ["김민지", "이준호", "박서연"] as const;
-type Teacher = (typeof TEACHERS)[number];
+// ───────────────────────── Types & Context ─────────────────────────
 
-type Slot = {
-  id: string;
-  dateKey: string; // YYYY-MM-DD
-  time: string; // HH:mm
-  teacher: Teacher;
-  booked: boolean;
+const LEVELS = [
+  { value: "Lv1", label: "Lv1 입문 - 짧게 반응 가능" },
+  { value: "Lv2", label: "Lv2 초급 - 간단한 질문 답변" },
+  { value: "Lv3", label: "Lv3 초중급 - 대화는 가능" },
+  { value: "Lv4", label: "Lv4 중급 - 일상대화 참여" },
+  { value: "Lv5", label: "Lv5 중고급 - 꽤 유창함" },
+  { value: "Lv6", label: "Lv6 고급 - 자유롭게 토론" },
+] as const;
+
+const VALID_COUPONS = ["AAA999", "BBB123", "CCC456"];
+
+const DAY_LABELS = ["월", "화", "수", "목", "금"] as const;
+const DAY_VALUES = [1, 2, 3, 4, 5] as const;
+type DayValue = (typeof DAY_VALUES)[number];
+
+type FormState = {
+  coupon: string;
+  name: string;
+  phone: string;
+  kakaoLinked: boolean;
+  level: string;
+  selectedDays: DayValue[]; // up to 2, in selection order
+  selectedTime: string;
 };
 
-function ymd(d: Date) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
+const initialForm: FormState = {
+  coupon: "",
+  name: "",
+  phone: "",
+  kakaoLinked: false,
+  level: "",
+  selectedDays: [],
+  selectedTime: "",
+};
 
-const WEEK_DAYS = ["일", "월", "화", "수", "목", "금", "토"];
+type Ctx = {
+  form: FormState;
+  setForm: React.Dispatch<React.SetStateAction<FormState>>;
+  step: number;
+  goNext: () => void;
+  goPrev: () => void;
+  reset: () => void;
+};
 
-function buildDates() {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return Array.from({ length: 7 }, (_, i) => {
-    const d = new Date(today);
-    d.setDate(today.getDate() + i);
-    return d;
-  });
-}
+const FormCtx = createContext<Ctx | null>(null);
+const useForm = () => {
+  const c = useContext(FormCtx);
+  if (!c) throw new Error("FormCtx missing");
+  return c;
+};
+
+// ───────────────────────── Helpers ─────────────────────────
 
 const TIMES: string[] = (() => {
   const out: string[] = [];
@@ -72,247 +89,449 @@ const TIMES: string[] = (() => {
   return out;
 })();
 
-// 시드 기반 의사난수 (안정적인 mock)
-function seeded(seed: number) {
-  let s = seed;
-  return () => {
-    s = (s * 9301 + 49297) % 233280;
-    return s / 233280;
-  };
+// mock 마감 슬롯 (요일 조합과 무관하게 고정)
+const CLOSED_TIMES = new Set(["18:40", "19:40", "20:20", "21:40"]);
+
+function getNextDayOfWeek(targetDay: DayValue, base = new Date()): Date {
+  const date = new Date(base);
+  date.setHours(0, 0, 0, 0);
+  const currentDay = date.getDay() === 0 ? 7 : date.getDay();
+  let diff = targetDay - currentDay;
+  if (diff <= 0) diff += 7;
+  date.setDate(date.getDate() + diff);
+  return date;
 }
 
-function generateSlots(): Slot[] {
-  const dates = buildDates();
-  const rand = seeded(42);
-  const slots: Slot[] = [];
-  for (const d of dates) {
-    const dateKey = ymd(d);
-    for (const time of TIMES) {
-      // 각 시간대마다 1~2명 선생님 배치
-      const shuffled = [...TEACHERS].sort(() => rand() - 0.5);
-      const count = rand() > 0.5 ? 2 : 1;
-      for (let i = 0; i < count; i++) {
-        slots.push({
-          id: `${dateKey}-${time}-${shuffled[i]}`,
-          dateKey,
-          time,
-          teacher: shuffled[i],
-          booked: rand() < 0.2,
-        });
-      }
+function fmtMD(d: Date) {
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function dayLabel(v: DayValue) {
+  return DAY_LABELS[v - 1];
+}
+
+// 4회 수업 일정 계산: 선택한 두 요일에 주 2회 × 2주
+function computeSchedule(days: DayValue[], time: string) {
+  if (days.length !== 2 || !time) return [];
+  const dates = days.map((d) => getNextDayOfWeek(d)).sort((a, b) => a.getTime() - b.getTime());
+  const sortedDays: DayValue[] = dates.map(
+    (d) => (d.getDay() === 0 ? 7 : d.getDay()) as DayValue,
+  );
+  const result: { date: Date; day: DayValue; time: string }[] = [];
+  for (let week = 0; week < 2; week++) {
+    for (let i = 0; i < 2; i++) {
+      const d = new Date(dates[i]);
+      d.setDate(d.getDate() + week * 7);
+      result.push({ date: d, day: sortedDays[i], time });
     }
   }
-  return slots;
+  return result;
 }
 
-function BookingPage() {
-  const dates = useMemo(buildDates, []);
-  const [selectedDate, setSelectedDate] = useState(ymd(dates[0]));
-  const [teacherFilter, setTeacherFilter] = useState<"all" | Teacher>("all");
-  const [slots, setSlots] = useState<Slot[]>(() => generateSlots());
-  const [activeSlot, setActiveSlot] = useState<Slot | null>(null);
-  const [form, setForm] = useState({ name: "", email: "", coupon: "" });
+// ───────────────────────── Page ─────────────────────────
 
-  const visibleByTime = useMemo(() => {
-    const map = new Map<string, Slot[]>();
-    for (const t of TIMES) map.set(t, []);
-    for (const s of slots) {
-      if (s.dateKey !== selectedDate) continue;
-      if (teacherFilter !== "all" && s.teacher !== teacherFilter) continue;
-      map.get(s.time)?.push(s);
-    }
-    return map;
-  }, [slots, selectedDate, teacherFilter]);
+const STEPS = [1, 6, 7] as const;
 
-  const openBooking = (slot: Slot) => {
-    if (slot.booked) return;
-    setActiveSlot(slot);
-    setForm({ name: "", email: "", coupon: "" });
+function BookingFlowPage() {
+  const [form, setForm] = useState<FormState>(initialForm);
+  const [stepIdx, setStepIdx] = useState(0);
+
+  const ctx: Ctx = {
+    form,
+    setForm,
+    step: STEPS[stepIdx],
+    goNext: () => setStepIdx((i) => Math.min(i + 1, STEPS.length - 1)),
+    goPrev: () => setStepIdx((i) => Math.max(i - 1, 0)),
+    reset: () => {
+      setForm(initialForm);
+      setStepIdx(0);
+    },
   };
 
-  const submitBooking = () => {
-    if (!activeSlot) return;
-    if (!form.name.trim() || !form.email.trim()) {
-      toast.error("이름과 이메일을 입력해주세요.");
+  const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+  return (
+    <FormCtx.Provider value={ctx}>
+      <div className="min-h-screen bg-background text-foreground">
+        <Toaster position="top-center" richColors />
+        <div className="mx-auto max-w-xl px-4 pb-10 pt-6 sm:pt-8">
+          {/* 진행률 */}
+          <div className="mb-6">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-semibold text-muted-foreground">
+                STEP {stepIdx + 1} / {STEPS.length}
+              </span>
+              <span className="text-xs font-medium text-primary">
+                {stepIdx + 1}/{STEPS.length}
+              </span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-primary transition-all duration-300"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          </div>
+
+          {stepIdx === 0 && <StepCoupon />}
+          {stepIdx === 1 && <StepRegistration />}
+          {stepIdx === 2 && <StepSchedule />}
+        </div>
+      </div>
+    </FormCtx.Provider>
+  );
+}
+
+// ───────────────────────── Step 1: 쿠폰 ─────────────────────────
+
+function StepCoupon() {
+  const { form, setForm, goNext } = useForm();
+  const [error, setError] = useState("");
+
+  const verify = () => {
+    const code = form.coupon.trim().toUpperCase();
+    if (!VALID_COUPONS.includes(code)) {
+      setError("유효하지 않은 코드입니다");
       return;
     }
-    setSlots((prev) =>
-      prev.map((s) => (s.id === activeSlot.id ? { ...s, booked: true } : s))
-    );
-    setActiveSlot(null);
-    toast.success("예약이 완료되었습니다!", { duration: 3000 });
-  };
-
-  const formatSlotLabel = (s: Slot) => {
-    const d = new Date(s.dateKey);
-    return `${s.teacher} 선생님 - ${d.getMonth() + 1}월 ${d.getDate()}일 ${s.time}`;
+    setError("");
+    setForm((f) => ({ ...f, coupon: code }));
+    goNext();
   };
 
   return (
-    <div className="min-h-screen bg-background">
-      <Toaster position="top-center" richColors />
-      <div className="mx-auto max-w-5xl px-4 py-8 sm:py-12">
-        <header className="mb-8">
-          <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
-            전화영어 수업 예약
-          </h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            원하는 날짜와 시간을 선택해 수업을 예약하세요.
-          </p>
-        </header>
+    <StepShell title="🎟️ 초대 코드를 입력해 주세요" description="발급받은 초대 코드를 입력하면 수업 신청을 시작할 수 있어요.">
+      <div className="space-y-2">
+        <Label htmlFor="coupon" className="text-sm font-semibold">
+          쿠폰 번호
+        </Label>
+        <Input
+          id="coupon"
+          placeholder="AAA999"
+          value={form.coupon}
+          onChange={(e) => {
+            setForm((f) => ({ ...f, coupon: e.target.value }));
+            if (error) setError("");
+          }}
+          className="h-12 rounded-lg text-base uppercase tracking-wider"
+          autoFocus
+        />
+        {error && <p className="text-sm font-medium text-destructive">{error}</p>}
+      </div>
 
-        {/* 날짜 선택 */}
-        <section className="mb-6">
-          <Label className="mb-3 block text-sm font-semibold">날짜 선택</Label>
-          <div className="flex gap-2 overflow-x-auto pb-2 -mx-1 px-1">
-            {dates.map((d) => {
-              const key = ymd(d);
-              const active = key === selectedDate;
-              const isToday = key === ymd(new Date());
+      <div className="pt-2">
+        <Button onClick={verify} className="h-12 w-full rounded-lg text-base font-semibold">
+          인증하기
+        </Button>
+      </div>
+
+      <NavBar nextLabel="다음" onNext={verify} hidePrev nextDisabled={!form.coupon.trim()} />
+    </StepShell>
+  );
+}
+
+// ───────────────────────── Step 6: 수강 등록 ─────────────────────────
+
+function formatPhone(raw: string) {
+  const digits = raw.replace(/\D/g, "").slice(0, 11);
+  if (digits.length < 4) return digits;
+  if (digits.length < 8) return `${digits.slice(0, 3)}-${digits.slice(3)}`;
+  return `${digits.slice(0, 3)}-${digits.slice(3, 7)}-${digits.slice(7)}`;
+}
+
+function StepRegistration() {
+  const { form, setForm } = useForm();
+
+  const phoneValid = /^010-\d{4}-\d{4}$/.test(form.phone);
+  const canNext = form.name.trim().length > 0 && phoneValid && form.level.length > 0;
+
+  return (
+    <StepShell title="📝 수강 등록 신청서" description="수업 안내를 위해 기본 정보를 입력해 주세요.">
+      <div className="space-y-2">
+        <Label htmlFor="name" className="text-sm font-semibold">
+          이름 <span className="text-destructive">*</span>
+        </Label>
+        <Input
+          id="name"
+          placeholder="홍길동"
+          value={form.name}
+          onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+          className="h-12 rounded-lg text-base"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <Label htmlFor="phone" className="text-sm font-semibold">
+          연락처 <span className="text-destructive">*</span>
+        </Label>
+        <Input
+          id="phone"
+          inputMode="numeric"
+          placeholder="010-0000-0000"
+          value={form.phone}
+          onChange={(e) => setForm((f) => ({ ...f, phone: formatPhone(e.target.value) }))}
+          className="h-12 rounded-lg text-base"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <Label className="text-sm font-semibold">카카오톡 연동</Label>
+        <div className="flex items-center gap-3">
+          <Button
+            type="button"
+            variant={form.kakaoLinked ? "secondary" : "outline"}
+            onClick={() => setForm((f) => ({ ...f, kakaoLinked: true }))}
+            disabled={form.kakaoLinked}
+            className="h-11 min-w-[88px] rounded-lg"
+          >
+            확인
+          </Button>
+          {form.kakaoLinked && (
+            <span className="text-sm font-semibold text-primary">✓ 연동 완료</span>
+          )}
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <Label className="text-sm font-semibold">
+          영어 실력 <span className="text-destructive">*</span>
+        </Label>
+        <Select value={form.level} onValueChange={(v) => setForm((f) => ({ ...f, level: v }))}>
+          <SelectTrigger className="h-12 rounded-lg text-base">
+            <SelectValue placeholder="현재 영어 실력을 선택해 주세요" />
+          </SelectTrigger>
+          <SelectContent>
+            {LEVELS.map((l) => (
+              <SelectItem key={l.value} value={l.value}>
+                {l.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <NavBar nextDisabled={!canNext} />
+    </StepShell>
+  );
+}
+
+// ───────────────────────── Step 7: 요일·시간 ─────────────────────────
+
+function StepSchedule() {
+  const { form, setForm, reset } = useForm();
+  const { selectedDays, selectedTime } = form;
+
+  const dayDates = useMemo(() => {
+    const map = new Map<DayValue, Date>();
+    for (const d of DAY_VALUES) map.set(d, getNextDayOfWeek(d));
+    return map;
+  }, []);
+
+  const toggleDay = (d: DayValue) => {
+    setForm((f) => {
+      const cur = f.selectedDays;
+      if (cur.includes(d)) {
+        return { ...f, selectedDays: cur.filter((x) => x !== d), selectedTime: "" };
+      }
+      if (cur.length < 2) {
+        return { ...f, selectedDays: [...cur, d], selectedTime: "" };
+      }
+      // 2개 이미 선택 → 가장 먼저 선택한 것 제거 후 새 것 추가
+      return { ...f, selectedDays: [cur[1], d], selectedTime: "" };
+    });
+  };
+
+  const schedule = useMemo(
+    () => computeSchedule(selectedDays, selectedTime),
+    [selectedDays, selectedTime],
+  );
+
+  const sortedDayLabels = useMemo(() => {
+    if (selectedDays.length !== 2) return [];
+    const sorted = [...selectedDays].sort((a, b) => {
+      const da = dayDates.get(a)!.getTime();
+      const db = dayDates.get(b)!.getTime();
+      return da - db;
+    });
+    return sorted.map(dayLabel);
+  }, [selectedDays, dayDates]);
+
+  const submit = () => {
+    if (selectedDays.length !== 2 || !selectedTime) return;
+    const payload = {
+      coupon: form.coupon,
+      name: form.name,
+      phone: form.phone,
+      kakaoLinked: form.kakaoLinked,
+      level: form.level,
+      days: [...selectedDays].sort((a, b) => a - b).map(dayLabel),
+      time: selectedTime,
+      schedule: schedule.map((s) => ({
+        date: fmtMD(s.date),
+        day: dayLabel(s.day),
+        time: s.time,
+      })),
+    };
+    // eslint-disable-next-line no-console
+    console.log("[예약 신청 데이터]", payload);
+    toast.success("예약이 완료되었습니다!", { duration: 3000 });
+    reset();
+  };
+
+  return (
+    <StepShell
+      title="📅 수업 요일을 선택하세요 (2개)"
+      description="⚠️ 무료수강권은 주 2회 수업만 가능합니다"
+    >
+      {/* 요일 */}
+      <div className="grid grid-cols-5 gap-2">
+        {DAY_VALUES.map((d) => {
+          const date = dayDates.get(d)!;
+          const active = selectedDays.includes(d);
+          return (
+            <button
+              key={d}
+              type="button"
+              onClick={() => toggleDay(d)}
+              className={cn(
+                "flex min-h-[72px] flex-col items-center justify-center rounded-lg border px-2 py-3 transition-all",
+                active
+                  ? "border-primary bg-primary text-primary-foreground shadow-sm"
+                  : "border-border bg-card text-foreground hover:border-primary/50",
+              )}
+            >
+              <span className="text-base font-semibold">{dayLabel(d)}</span>
+              <span
+                className={cn(
+                  "mt-1 text-xs tabular-nums",
+                  active ? "opacity-90" : "text-muted-foreground",
+                )}
+              >
+                {fmtMD(date)}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        ※ 표시된 날짜는 첫 수업 시작일입니다.
+        <br />
+        이후 매주 같은 요일·시간에 수업합니다.
+      </p>
+
+      {/* 시간 */}
+      {selectedDays.length === 2 && (
+        <div className="space-y-3 pt-2">
+          <h3 className="text-sm font-semibold">
+            🕐 {sortedDayLabels.join("·")} 모두 가능한 시간
+          </h3>
+          <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+            {TIMES.map((t) => {
+              const closed = CLOSED_TIMES.has(t);
+              const active = selectedTime === t;
               return (
                 <button
-                  key={key}
-                  onClick={() => setSelectedDate(key)}
+                  key={t}
+                  type="button"
+                  disabled={closed}
+                  onClick={() => setForm((f) => ({ ...f, selectedTime: t }))}
                   className={cn(
-                    "flex min-w-[64px] flex-col items-center rounded-xl border px-3 py-2.5 transition-all",
-                    active
-                      ? "border-primary bg-primary text-primary-foreground shadow-sm"
-                      : "border-border bg-card text-foreground hover:border-primary/50"
+                    "flex min-h-[48px] flex-col items-center justify-center rounded-lg border px-2 py-2 text-sm font-semibold tabular-nums transition-all",
+                    closed
+                      ? "cursor-not-allowed border-border bg-muted text-muted-foreground"
+                      : active
+                        ? "border-2 border-primary bg-primary/5 text-primary shadow-sm"
+                        : "border-emerald-200 bg-emerald-50 text-emerald-700 hover:border-emerald-400",
                   )}
                 >
-                  <span className={cn("text-xs", active ? "opacity-90" : "text-muted-foreground")}>
-                    {WEEK_DAYS[d.getDay()]}
-                  </span>
-                  <span className="mt-1 text-lg font-semibold leading-none">{d.getDate()}</span>
-                  {isToday && (
-                    <span className={cn("mt-1 text-[10px]", active ? "opacity-90" : "text-primary")}>
-                      오늘
-                    </span>
-                  )}
+                  <span>{t}</span>
+                  {closed && <span className="mt-0.5 text-[10px] font-medium">마감</span>}
                 </button>
               );
             })}
           </div>
-        </section>
+        </div>
+      )}
 
-        {/* 선생님 필터 */}
-        <section className="mb-6 flex items-center gap-3">
-          <Label className="text-sm font-semibold">선생님</Label>
-          <Select
-            value={teacherFilter}
-            onValueChange={(v) => setTeacherFilter(v as "all" | Teacher)}
-          >
-            <SelectTrigger className="w-[160px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">전체</SelectItem>
-              {TEACHERS.map((t) => (
-                <SelectItem key={t} value={t}>
-                  {t}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </section>
+      {/* 요약 */}
+      {selectedDays.length === 2 && selectedTime && schedule.length === 4 && (
+        <div className="space-y-2 rounded-lg border border-primary/20 bg-primary/5 p-4 text-sm">
+          <p className="font-semibold text-foreground">선택한 시간: {selectedTime}</p>
+          <p className="text-foreground">
+            📌 첫 수업: {fmtMD(schedule[0].date)} ({dayLabel(schedule[0].day)}){" "}
+            {schedule[0].time}
+          </p>
+          <p className="text-foreground">
+            📌 마지막 수업: {fmtMD(schedule[3].date)} ({dayLabel(schedule[3].day)}){" "}
+            {schedule[3].time}
+          </p>
+          <p className="text-xs text-muted-foreground">(주2회 × 2주 = 총 4회)</p>
+        </div>
+      )}
 
-        {/* 시간 슬롯 그리드 */}
-        <section>
-          <Label className="mb-3 block text-sm font-semibold">시간 선택</Label>
-          <div className="space-y-3">
-            {TIMES.map((time) => {
-              const items = visibleByTime.get(time) ?? [];
-              return (
-                <div key={time} className="flex items-start gap-3">
-                  <div className="w-14 pt-2.5 text-sm font-medium tabular-nums text-foreground">
-                    {time}
-                  </div>
-                  <div className="grid flex-1 grid-cols-2 gap-2 sm:grid-cols-3">
-                    {items.length === 0 ? (
-                      <div className="col-span-full rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
-                        가능한 슬롯 없음
-                      </div>
-                    ) : (
-                      items.map((s) => (
-                        <button
-                          key={s.id}
-                          disabled={s.booked}
-                          onClick={() => openBooking(s)}
-                          className={cn(
-                            "rounded-lg border px-3 py-2.5 text-left transition-all",
-                            s.booked
-                              ? "cursor-not-allowed border-border bg-muted text-muted-foreground"
-                              : "border-border bg-card hover:border-primary hover:bg-primary/5 hover:shadow-sm"
-                          )}
-                        >
-                          <div className="text-sm font-semibold text-foreground">
-                            {s.teacher}
-                          </div>
-                          <div className="mt-0.5 text-xs">
-                            {s.booked ? (
-                              <span className="text-muted-foreground">예약됨</span>
-                            ) : (
-                              <span className="text-primary">예약 가능</span>
-                            )}
-                          </div>
-                        </button>
-                      ))
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
+      <NavBar
+        nextLabel="예약 완료"
+        onNext={submit}
+        nextDisabled={selectedDays.length !== 2 || !selectedTime}
+      />
+    </StepShell>
+  );
+}
+
+// ───────────────────────── Shared ─────────────────────────
+
+function StepShell({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="space-y-5">
+      <div className="space-y-1.5">
+        <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{title}</h1>
+        {description && <p className="text-sm text-muted-foreground">{description}</p>}
       </div>
+      {children}
+    </div>
+  );
+}
 
-      {/* 예약 모달 */}
-      <Dialog open={!!activeSlot} onOpenChange={(o) => !o && setActiveSlot(null)}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>수업 예약</DialogTitle>
-            <DialogDescription>
-              {activeSlot ? formatSlotLabel(activeSlot) : ""}
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-2">
-            <div className="space-y-1.5">
-              <Label htmlFor="name">이름</Label>
-              <Input
-                id="name"
-                placeholder="홍길동"
-                value={form.name}
-                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="email">이메일</Label>
-              <Input
-                id="email"
-                type="email"
-                placeholder="you@example.com"
-                value={form.email}
-                onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="coupon">쿠폰 번호 (선택)</Label>
-              <Input
-                id="coupon"
-                placeholder="쿠폰 번호 입력"
-                value={form.coupon}
-                onChange={(e) => setForm((f) => ({ ...f, coupon: e.target.value }))}
-              />
-            </div>
-          </div>
-          <DialogFooter className="gap-2 sm:gap-2">
-            <Button variant="outline" onClick={() => setActiveSlot(null)}>
-              취소
-            </Button>
-            <Button onClick={submitBooking}>예약하기</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+function NavBar({
+  onNext,
+  nextLabel = "다음",
+  nextDisabled,
+  hidePrev,
+}: {
+  onNext?: () => void;
+  nextLabel?: string;
+  nextDisabled?: boolean;
+  hidePrev?: boolean;
+}) {
+  const { goNext, goPrev, step } = useForm();
+  const showPrev = !hidePrev && step !== 1;
+  return (
+    <div className="flex gap-2 pt-4">
+      {showPrev && (
+        <Button
+          variant="outline"
+          onClick={goPrev}
+          className="h-12 flex-1 rounded-lg text-base font-semibold"
+        >
+          이전
+        </Button>
+      )}
+      <Button
+        onClick={onNext ?? goNext}
+        disabled={nextDisabled}
+        className={cn("h-12 rounded-lg text-base font-semibold", showPrev ? "flex-1" : "w-full")}
+      >
+        {nextLabel}
+      </Button>
     </div>
   );
 }
