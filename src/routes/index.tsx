@@ -1,5 +1,12 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
@@ -13,16 +20,29 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { createClient } from "@supabase/supabase-js";
 
-export const Route = createFileRoute("/")({
-  component: BookingFlowPage,
-  head: () => ({
-    meta: [
-      { title: "전화영어 수업 예약" },
-      { name: "description", content: "초대 코드 인증 후 수업 요일과 시간을 선택해 예약하세요." },
-    ],
-  }),
-});
+// ───────────────────────── Supabase Client ─────────────────────────
+
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY,
+);
+
+export const Route = createFileRoute("/")(
+  {
+    component: BookingFlowPage,
+    head: () => ({
+      meta: [
+        { title: "전화영어 수업 예약" },
+        {
+          name: "description",
+          content: "초대 코드 인증 후 수업 요일과 시간을 선택해 예약하세요.",
+        },
+      ],
+    }),
+  },
+);
 
 // ───────────────────────── Types & Context ─────────────────────────
 
@@ -35,8 +55,6 @@ const LEVELS = [
   { value: "Lv6", label: "Lv6 고급 - 자유롭게 토론" },
 ] as const;
 
-const VALID_COUPONS = ["AAA999", "BBB123", "CCC456"];
-
 const DAY_LABELS = ["월", "화", "수", "목", "금"] as const;
 const DAY_VALUES = [1, 2, 3, 4, 5] as const;
 type DayValue = (typeof DAY_VALUES)[number];
@@ -47,7 +65,7 @@ type FormState = {
   phone: string;
   kakaoLinked: boolean;
   level: string;
-  selectedDays: DayValue[]; // up to 2, in selection order
+  selectedDays: DayValue[];
   selectedTime: string;
 };
 
@@ -79,19 +97,6 @@ const useForm = () => {
 
 // ───────────────────────── Helpers ─────────────────────────
 
-const TIMES: string[] = (() => {
-  const out: string[] = [];
-  for (let h = 18; h <= 22; h++) {
-    for (const m of [0, 20, 40]) {
-      out.push(`${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`);
-    }
-  }
-  return out;
-})();
-
-// mock 마감 슬롯 (요일 조합과 무관하게 고정)
-const CLOSED_TIMES = new Set(["18:40", "19:40", "20:20", "21:40"]);
-
 function getNextDayOfWeek(targetDay: DayValue, base = new Date()): Date {
   const date = new Date(base);
   date.setHours(0, 0, 0, 0);
@@ -113,7 +118,9 @@ function dayLabel(v: DayValue) {
 // 4회 수업 일정 계산: 선택한 두 요일에 주 2회 × 2주
 function computeSchedule(days: DayValue[], time: string) {
   if (days.length !== 2 || !time) return [];
-  const dates = days.map((d) => getNextDayOfWeek(d)).sort((a, b) => a.getTime() - b.getTime());
+  const dates = days
+    .map((d) => getNextDayOfWeek(d))
+    .sort((a, b) => a.getTime() - b.getTime());
   const sortedDays: DayValue[] = dates.map(
     (d) => (d.getDay() === 0 ? 7 : d.getDay()) as DayValue,
   );
@@ -182,50 +189,90 @@ function BookingFlowPage() {
   );
 }
 
-// ───────────────────────── Step 1: 쿠폰 ─────────────────────────
+// ───────────────────────── Step 1: 쿠폰 (Supabase 연동) ─────────────────────────
 
 function StepCoupon() {
   const { form, setForm, goNext } = useForm();
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const verify = () => {
+  const verify = async () => {
     const code = form.coupon.trim().toUpperCase();
-    if (!VALID_COUPONS.includes(code)) {
-      setError("유효하지 않은 코드입니다");
-      return;
-    }
+    if (!code) return;
+
+    setLoading(true);
     setError("");
-    setForm((f) => ({ ...f, coupon: code }));
-    goNext();
+
+    try {
+      // Supabase에서 쿠폰 검증
+      const { data, error: dbError } = await supabase
+        .from("coupons")
+        .select("code, is_used")
+        .eq("code", code)
+        .single();
+
+      if (dbError || !data) {
+        setError("유효하지 않은 코드입니다");
+        return;
+      }
+
+      if (data.is_used) {
+        setError("이미 사용된 코드입니다");
+        return;
+      }
+
+      setForm((f) => ({ ...f, coupon: code }));
+      goNext();
+    } catch {
+      setError("네트워크 오류가 발생했습니다. 다시 시도해주세요.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
-    <StepShell title="🎟️ 초대 코드를 입력해 주세요" description="발급받은 초대 코드를 입력하면 수업 신청을 시작할 수 있어요.">
+    <StepShell
+      title="🎟️ 초대 코드를 입력해 주세요"
+      description="발급받은 초대 코드를 입력하면 수업 신청을 시작할 수 있어요."
+    >
       <div className="space-y-2">
         <Label htmlFor="coupon" className="text-sm font-semibold">
           쿠폰 번호
         </Label>
         <Input
           id="coupon"
-          placeholder="AAA999"
+          placeholder="예: TST001"
           value={form.coupon}
           onChange={(e) => {
             setForm((f) => ({ ...f, coupon: e.target.value }));
             if (error) setError("");
           }}
+          onKeyDown={(e) => e.key === "Enter" && verify()}
           className="h-12 rounded-lg text-base uppercase tracking-wider"
           autoFocus
+          disabled={loading}
         />
-        {error && <p className="text-sm font-medium text-destructive">{error}</p>}
+        {error && (
+          <p className="text-sm font-medium text-destructive">{error}</p>
+        )}
       </div>
 
       <div className="pt-2">
-        <Button onClick={verify} className="h-12 w-full rounded-lg text-base font-semibold">
-          인증하기
+        <Button
+          onClick={verify}
+          disabled={!form.coupon.trim() || loading}
+          className="h-12 w-full rounded-lg text-base font-semibold"
+        >
+          {loading ? "확인 중..." : "인증하기"}
         </Button>
       </div>
 
-      <NavBar nextLabel="다음" onNext={verify} hidePrev nextDisabled={!form.coupon.trim()} />
+      <NavBar
+        nextLabel="다음"
+        onNext={verify}
+        hidePrev
+        nextDisabled={!form.coupon.trim() || loading}
+      />
     </StepShell>
   );
 }
@@ -246,7 +293,10 @@ function StepRegistration() {
   const canNext = form.name.trim().length > 0 && phoneValid && form.level.length > 0;
 
   return (
-    <StepShell title="📝 수강 등록 신청서" description="수업 안내를 위해 기본 정보를 입력해 주세요.">
+    <StepShell
+      title="📝 수강 등록 신청서"
+      description="수업 안내를 위해 기본 정보를 입력해 주세요."
+    >
       <div className="space-y-2">
         <Label htmlFor="name" className="text-sm font-semibold">
           이름 <span className="text-destructive">*</span>
@@ -269,7 +319,9 @@ function StepRegistration() {
           inputMode="numeric"
           placeholder="010-0000-0000"
           value={form.phone}
-          onChange={(e) => setForm((f) => ({ ...f, phone: formatPhone(e.target.value) }))}
+          onChange={(e) =>
+            setForm((f) => ({ ...f, phone: formatPhone(e.target.value) }))
+          }
           className="h-12 rounded-lg text-base"
         />
       </div>
@@ -296,7 +348,10 @@ function StepRegistration() {
         <Label className="text-sm font-semibold">
           영어 실력 <span className="text-destructive">*</span>
         </Label>
-        <Select value={form.level} onValueChange={(v) => setForm((f) => ({ ...f, level: v }))}>
+        <Select
+          value={form.level}
+          onValueChange={(v) => setForm((f) => ({ ...f, level: v }))}
+        >
           <SelectTrigger className="h-12 rounded-lg text-base">
             <SelectValue placeholder="현재 영어 실력을 선택해 주세요" />
           </SelectTrigger>
@@ -315,11 +370,62 @@ function StepRegistration() {
   );
 }
 
-// ───────────────────────── Step 7: 요일·시간 ─────────────────────────
+// ───────────────────────── Step 7: 요일·시간 (Supabase 연동) ─────────────────────────
+
+type AvailabilityRow = {
+  day_of_week: number;
+  time_slot: string;
+  is_available: boolean;
+};
 
 function StepSchedule() {
   const { form, setForm, reset } = useForm();
   const { selectedDays, selectedTime } = form;
+
+  // Supabase에서 availability 가져오기
+  const [availability, setAvailability] = useState<AvailabilityRow[]>([]);
+  const [loadingSlots, setLoadingSlots] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    const fetchAvailability = async () => {
+      setLoadingSlots(true);
+      const { data } = await supabase
+        .from("availability")
+        .select("day_of_week, time_slot, is_available")
+        .eq("is_available", true);
+      setAvailability(data ?? []);
+      setLoadingSlots(false);
+    };
+    fetchAvailability();
+  }, []);
+
+  // 가용 요일 목록 (availability에 있는 요일만 활성화)
+  const availableDays = useMemo(() => {
+    const days = new Set(availability.map((a) => a.day_of_week as DayValue));
+    return days;
+  }, [availability]);
+
+  // 선택한 두 요일 모두에서 가능한 시간 슬롯 계산
+  const availableTimes = useMemo(() => {
+    if (selectedDays.length !== 2) return [];
+
+    // 각 요일에서 가능한 시간 슬롯 Set
+    const timeSetsPerDay = selectedDays.map((day) => {
+      const times = availability
+        .filter((a) => a.day_of_week === day && a.is_available)
+        .map((a) => a.time_slot.slice(0, 5)); // "18:00:00" → "18:00"
+      return new Set(times);
+    });
+
+    // 두 요일 모두 가능한 시간만 (교집합)
+    const intersection = [...timeSetsPerDay[0]].filter((t) =>
+      timeSetsPerDay[1].has(t),
+    );
+
+    // 시간순 정렬
+    return intersection.sort();
+  }, [selectedDays, availability]);
 
   const dayDates = useMemo(() => {
     const map = new Map<DayValue, Date>();
@@ -336,7 +442,6 @@ function StepSchedule() {
       if (cur.length < 2) {
         return { ...f, selectedDays: [...cur, d], selectedTime: "" };
       }
-      // 2개 이미 선택 → 가장 먼저 선택한 것 제거 후 새 것 추가
       return { ...f, selectedDays: [cur[1], d], selectedTime: "" };
     });
   };
@@ -356,26 +461,54 @@ function StepSchedule() {
     return sorted.map(dayLabel);
   }, [selectedDays, dayDates]);
 
-  const submit = () => {
+  const submit = async () => {
     if (selectedDays.length !== 2 || !selectedTime) return;
-    const payload = {
-      coupon: form.coupon,
-      name: form.name,
-      phone: form.phone,
-      kakaoLinked: form.kakaoLinked,
-      level: form.level,
-      days: [...selectedDays].sort((a, b) => a - b).map(dayLabel),
-      time: selectedTime,
-      schedule: schedule.map((s) => ({
-        date: fmtMD(s.date),
-        day: dayLabel(s.day),
-        time: s.time,
-      })),
-    };
-    // eslint-disable-next-line no-console
-    console.log("[예약 신청 데이터]", payload);
-    toast.success("예약이 완료되었습니다!", { duration: 3000 });
-    reset();
+
+    setSubmitting(true);
+    try {
+      // 1. bookings 테이블에 INSERT
+      const { data: booking, error: bookingError } = await supabase
+        .from("bookings")
+        .insert({
+          coupon_code: form.coupon,
+          student_name: form.name,
+          student_phone: form.phone,
+          student_kakao: form.kakaoLinked,
+          english_level: form.level,
+          selected_days: [...selectedDays].sort((a, b) => a - b).map(dayLabel),
+          selected_time: selectedTime,
+          schedule: schedule.map((s) => ({
+            date: fmtMD(s.date),
+            day: dayLabel(s.day),
+            time: s.time,
+          })),
+        })
+        .select()
+        .single();
+
+      if (bookingError) throw bookingError;
+
+      // 2. coupons 테이블 사용 처리
+      await supabase
+        .from("coupons")
+        .update({
+          is_used: true,
+          used_by_booking: booking.id,
+          used_at: new Date().toISOString(),
+        })
+        .eq("code", form.coupon);
+
+      toast.success("🎉 예약이 완료되었습니다!", {
+        description: `${form.name}님, 첫 수업은 ${fmtMD(schedule[0].date)}(${dayLabel(schedule[0].day)}) ${selectedTime}입니다.`,
+        duration: 5000,
+      });
+      reset();
+    } catch (err) {
+      console.error(err);
+      toast.error("예약 중 오류가 발생했습니다. 다시 시도해주세요.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -383,97 +516,115 @@ function StepSchedule() {
       title="📅 수업 요일을 선택하세요 (2개)"
       description="⚠️ 무료수강권은 주 2회 수업만 가능합니다"
     >
-      {/* 요일 */}
-      <div className="grid grid-cols-5 gap-2">
-        {DAY_VALUES.map((d) => {
-          const date = dayDates.get(d)!;
-          const active = selectedDays.includes(d);
-          return (
-            <button
-              key={d}
-              type="button"
-              onClick={() => toggleDay(d)}
-              className={cn(
-                "flex min-h-[72px] flex-col items-center justify-center rounded-lg border px-2 py-3 transition-all",
-                active
-                  ? "border-primary bg-primary text-primary-foreground shadow-sm"
-                  : "border-border bg-card text-foreground hover:border-primary/50",
-              )}
-            >
-              <span className="text-base font-semibold">{dayLabel(d)}</span>
-              <span
-                className={cn(
-                  "mt-1 text-xs tabular-nums",
-                  active ? "opacity-90" : "text-muted-foreground",
-                )}
-              >
-                {fmtMD(date)}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-
-      <p className="text-xs leading-relaxed text-muted-foreground">
-        ※ 표시된 날짜는 첫 수업 시작일입니다.
-        <br />
-        이후 매주 같은 요일·시간에 수업합니다.
-      </p>
-
-      {/* 시간 */}
-      {selectedDays.length === 2 && (
-        <div className="space-y-3 pt-2">
-          <h3 className="text-sm font-semibold">
-            🕐 {sortedDayLabels.join("·")} 모두 가능한 시간
-          </h3>
-          <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-            {TIMES.map((t) => {
-              const closed = CLOSED_TIMES.has(t);
-              const active = selectedTime === t;
+      {loadingSlots ? (
+        <div className="flex items-center justify-center py-10 text-sm text-muted-foreground">
+          스케줄 불러오는 중...
+        </div>
+      ) : (
+        <>
+          {/* 요일 */}
+          <div className="grid grid-cols-5 gap-2">
+            {DAY_VALUES.map((d) => {
+              const date = dayDates.get(d)!;
+              const active = selectedDays.includes(d);
+              const isAvailable = availableDays.has(d);
               return (
                 <button
-                  key={t}
+                  key={d}
                   type="button"
-                  disabled={closed}
-                  onClick={() => setForm((f) => ({ ...f, selectedTime: t }))}
+                  onClick={() => isAvailable && toggleDay(d)}
+                  disabled={!isAvailable}
                   className={cn(
-                    "flex min-h-[48px] flex-col items-center justify-center rounded-lg border px-2 py-2 text-sm font-semibold tabular-nums transition-all",
-                    closed
-                      ? "cursor-not-allowed border-border bg-muted text-muted-foreground"
+                    "flex min-h-[72px] flex-col items-center justify-center rounded-lg border px-2 py-3 transition-all",
+                    !isAvailable
+                      ? "cursor-not-allowed border-border bg-muted text-muted-foreground opacity-40"
                       : active
-                        ? "border-2 border-primary bg-primary/5 text-primary shadow-sm"
-                        : "border-emerald-200 bg-emerald-50 text-emerald-700 hover:border-emerald-400",
+                        ? "border-primary bg-primary text-primary-foreground shadow-sm"
+                        : "border-border bg-card text-foreground hover:border-primary/50",
                   )}
                 >
-                  <span>{t}</span>
-                  {closed && <span className="mt-0.5 text-[10px] font-medium">마감</span>}
+                  <span className="text-base font-semibold">{dayLabel(d)}</span>
+                  <span
+                    className={cn(
+                      "mt-1 text-xs tabular-nums",
+                      active ? "opacity-90" : "text-muted-foreground",
+                    )}
+                  >
+                    {fmtMD(date)}
+                  </span>
+                  {!isAvailable && (
+                    <span className="mt-0.5 text-[10px] font-medium">마감</span>
+                  )}
                 </button>
               );
             })}
           </div>
-        </div>
-      )}
 
-      {/* 요약 */}
-      {selectedDays.length === 2 && selectedTime && schedule.length === 4 && (
-        <div className="space-y-2 rounded-lg border border-primary/20 bg-primary/5 p-4 text-sm">
-          <p className="font-semibold text-foreground">선택한 시간: {selectedTime}</p>
-          <p className="text-foreground">
-            📌 첫 수업: {fmtMD(schedule[0].date)} ({dayLabel(schedule[0].day)}){" "}
-            {schedule[0].time}
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            ※ 표시된 날짜는 첫 수업 시작일입니다.
+            <br />
+            이후 매주 같은 요일·시간에 수업합니다.
           </p>
-          <p className="text-foreground">
-            📌 마지막 수업: {fmtMD(schedule[3].date)} ({dayLabel(schedule[3].day)}){" "}
-            {schedule[3].time}
-          </p>
-          <p className="text-xs text-muted-foreground">(주2회 × 2주 = 총 4회)</p>
-        </div>
+
+          {/* 시간 */}
+          {selectedDays.length === 2 && (
+            <div className="space-y-3 pt-2">
+              <h3 className="text-sm font-semibold">
+                🕐 {sortedDayLabels.join("·")} 모두 가능한 시간
+              </h3>
+              {availableTimes.length === 0 ? (
+                <p className="text-sm text-destructive">
+                  선택한 두 요일에 공통으로 가능한 시간이 없습니다. 다른 요일을 선택해 주세요.
+                </p>
+              ) : (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {availableTimes.map((t) => {
+                    const active = selectedTime === t;
+                    return (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => setForm((f) => ({ ...f, selectedTime: t }))}
+                        className={cn(
+                          "flex min-h-[48px] flex-col items-center justify-center rounded-lg border px-2 py-2 text-sm font-semibold tabular-nums transition-all",
+                          active
+                            ? "border-2 border-primary bg-primary/5 text-primary shadow-sm"
+                            : "border-emerald-200 bg-emerald-50 text-emerald-700 hover:border-emerald-400",
+                        )}
+                      >
+                        <span>{t}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 요약 */}
+          {selectedDays.length === 2 && selectedTime && schedule.length === 4 && (
+            <div className="space-y-2 rounded-lg border border-primary/20 bg-primary/5 p-4 text-sm">
+              <p className="font-semibold text-foreground">
+                선택한 시간: {selectedTime}
+              </p>
+              <p className="text-foreground">
+                📌 첫 수업: {fmtMD(schedule[0].date)} ({dayLabel(schedule[0].day)}){" "}
+                {schedule[0].time}
+              </p>
+              <p className="text-foreground">
+                📌 마지막 수업: {fmtMD(schedule[3].date)} ({dayLabel(schedule[3].day)}){" "}
+                {schedule[3].time}
+              </p>
+              <p className="text-xs text-muted-foreground">(주2회 × 2주 = 총 4회)</p>
+            </div>
+          )}
+        </>
       )}
 
       <NavBar
-        nextLabel="예약 완료"
+        nextLabel={submitting ? "예약 중..." : "예약 완료"}
         onNext={submit}
-        nextDisabled={selectedDays.length !== 2 || !selectedTime}
+        nextDisabled={selectedDays.length !== 2 || !selectedTime || submitting}
       />
     </StepShell>
   );
@@ -494,7 +645,9 @@ function StepShell({
     <div className="space-y-5">
       <div className="space-y-1.5">
         <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{title}</h1>
-        {description && <p className="text-sm text-muted-foreground">{description}</p>}
+        {description && (
+          <p className="text-sm text-muted-foreground">{description}</p>
+        )}
       </div>
       {children}
     </div>
@@ -528,7 +681,10 @@ function NavBar({
       <Button
         onClick={onNext ?? goNext}
         disabled={nextDisabled}
-        className={cn("h-12 rounded-lg text-base font-semibold", showPrev ? "flex-1" : "w-full")}
+        className={cn(
+          "h-12 rounded-lg text-base font-semibold",
+          showPrev ? "flex-1" : "w-full",
+        )}
       >
         {nextLabel}
       </Button>
