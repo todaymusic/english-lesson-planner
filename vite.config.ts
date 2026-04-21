@@ -11,13 +11,7 @@ export default defineConfig({
     tailwindcss(),
     tsconfigPaths(),
   ],
-  root: ".",
   build: {
     outDir: "dist",
-    rollupOptions: {
-      input: {
-        main: "./index.html",
-      },
-    },
   },
 });
