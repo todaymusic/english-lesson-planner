@@ -20,7 +20,8 @@ export async function checkSupabaseConnection(): Promise<{
   message: string;
 }> {
   try {
-    const { error } = await supabase
+    // 테이블 타입이 아직 생성되지 않았을 수 있으므로 any 캐스팅으로 우회
+    const { error } = await (supabase as any)
       .from("coupons")
       .select("*", { count: "exact", head: true });
 
