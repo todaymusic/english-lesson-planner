@@ -5,6 +5,7 @@ import { TanStackRouterVite } from "@tanstack/router-plugin/vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 
 export default defineConfig({
+  base: "/english-lesson-planner/",
   plugins: [
     TanStackRouterVite({ autoCodeSplitting: true }),
     react(),
